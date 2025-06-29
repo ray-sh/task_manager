@@ -1,0 +1,164 @@
+<!-- livebook:{"app_settings":{"access_type":"public","output_type":"rich","slug":"task-scheduler"}} -->
+
+# Scheduled Task Manager
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.16.0"}
+])
+```
+
+## Core Components
+
+We'll define two core components for our scheduler:
+
+1. `TaskStore`: An `Agent` to hold our list of tasks.
+2. `TaskRunner`: A `GenServer` that periodically checks for due tasks and "executes" them.
+
+```elixir
+defmodule TaskStore do
+  use Agent
+
+  def start_link(_opts) do
+    pid = Process.whereis(__MODULE__)
+    if pid, do: Process.exit(pid, :kill)
+    Agent.start_link(fn -> %{} end, name: __MODULE__)
+  end
+
+  def get() do
+    Agent.get(__MODULE__, & &1)
+  end
+
+  def add_task(name, due_date) do
+    IO.puts("Add task #{name}")
+    task_id = System.unique_integer([:positive])
+    task = %{id: task_id, name: name, due_date: due_date, status: :pending}
+    Agent.update(__MODULE__, &Map.put(&1, task_id, task))
+  end
+
+  def update_task_status(task_id, status) do
+    Agent.update(__MODULE__, &update_in(&1, [task_id, :status], fn _ -> status end))
+  end
+end
+
+defmodule TaskRunner do
+  use GenServer
+
+  @check_interval 5_000 # 5 seconds
+
+  def start_link(opts) do
+    pid = Process.whereis(__MODULE__)
+    if pid, do: Process.exit(pid, :kill)
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(opts) do
+    # Schedule the first check
+    schedule_check()
+    {:ok, opts}
+  end
+
+  @impl true
+  def handle_info(:check_tasks, state) do
+    # IO.puts("Checking for due tasks...")
+
+    due_tasks =
+      TaskStore.get()
+      |> Enum.filter(fn {_, task} ->
+        task.status == :pending && NaiveDateTime.compare(task.due_date, NaiveDateTime.utc_now()) == :lt
+      end)
+
+    if Enum.any?(due_tasks) do
+      for {task_id, task} <- due_tasks do
+        # "Execute" the task
+        # Kino.log("Executing task: #{task.name}")
+        TaskStore.update_task_status(task_id, :completed)
+      end
+      # Re-render the UI
+      parent = self()
+      Task.start(fn -> send(parent, :render_ui) end)
+    end
+
+    schedule_check()
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:render_ui, state) do
+    tasks_frame = Keyword.get(state, :tasks_frame)
+    render_task_list(tasks_frame)
+    {:noreply, state}
+  end
+
+  defp schedule_check() do
+    Process.send_after(self(), :check_tasks, @check_interval)
+  end
+
+  defp render_task_list(frame) do
+    tasks =
+      TaskStore.get()
+      |> Map.values()
+      |> Enum.sort_by(fn task -> task.due_date end)
+
+    table =
+      Kino.DataTable.new(tasks,
+        keys: [:name, :due_date, :status],
+        labels: %{name: "Task Name", due_date: "Due Date", status: "Status"}
+      )
+
+    Kino.Frame.render(frame, table)
+  end
+end
+```
+
+## Application UI
+
+Now, let's build the user interface. We'll have a form to add tasks and a frame to display the current list of tasks.
+
+```elixir
+# --- UI Frames ---
+tasks_frame = Kino.Frame.new()
+
+# --- Start Application ---
+{:ok, _} = TaskStore.start_link([])
+{:ok, _} = TaskRunner.start_link(tasks_frame: tasks_frame)
+
+# --- Initial Render ---
+# We need to give the runner a moment to start up before the first render.
+Process.sleep(100)
+send(Process.whereis(TaskRunner), :render_ui)
+
+# --- Input Form ---
+form =
+  Kino.Control.form(
+    [
+      name: Kino.Input.text("Task Name"),
+      due_date: Kino.Input.utc_datetime("Execution Date and Time")
+    ],
+    submit: "Add Task"
+  )
+```
+
+## Task Submission Handler
+
+Finally, we listen for submissions on the form. When a user adds a new task, we'll add it to our `TaskStore` and update the displayed list.
+
+```elixir
+ Kino.listen(form, fn %{data: %{name: name, due_date: due_date}} ->
+  IO.puts("listen")
+  if name != "" and not is_nil(due_date) do
+    IO.puts("new task")
+    TaskStore.add_task(name, due_date)
+    send(Process.whereis(TaskRunner), :render_ui)
+  end
+end)
+```
+
+## Scheduled Tasks
+
+The table below will automatically update as you add tasks or as they are executed.
+
+```elixir
+tasks_frame
+```
