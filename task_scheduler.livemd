@@ -4,7 +4,8 @@
 
 ```elixir
 Mix.install([
-  {:kino, "~> 0.16.0"}
+  {:kino, "~> 0.16.0"},
+  {:crontab, "~> 1.1"}
 ])
 ```
 
@@ -29,15 +30,17 @@ defmodule TaskStore do
     Agent.get(__MODULE__, & &1)
   end
 
-  def add_task(name, due_date) do
+  def add_task(name, cron_string) do
     IO.puts("Add task #{name}")
     task_id = System.unique_integer([:positive])
-    task = %{id: task_id, name: name, due_date: due_date, status: :pending}
-    Agent.update(__MODULE__, &Map.put(&1, task_id, task))
-  end
 
-  def update_task_status(task_id, status) do
-    Agent.update(__MODULE__, &update_in(&1, [task_id, :status], fn _ -> status end))
+    task = %{
+      id: task_id,
+      name: name,
+      cron_string: cron_string,
+      status: :pending
+    }
+    Agent.update(__MODULE__, &Map.put(&1, task_id, task))
   end
 end
 
@@ -66,14 +69,19 @@ defmodule TaskRunner do
     due_tasks =
       TaskStore.get()
       |> Enum.filter(fn {_, task} ->
-        task.status == :pending && NaiveDateTime.compare(task.due_date, NaiveDateTime.utc_now()) == :lt
+        # Use Crontab to check if the task is due
+        case Crontab.CronExpression.Parser.parse(task.cron_string) do
+          {:ok, cron_expression} ->
+            Crontab.DateChecker.matches_date?(cron_expression, DateTime.to_naive(DateTime.utc_now())) && task.status == :pending
+          {:error, _} ->
+            false
+        end
       end)
 
     if Enum.any?(due_tasks) do
-      for {task_id, task} <- due_tasks do
+      for {_, task} <- due_tasks do
         # "Execute" the task
-        # Kino.log("Executing task: #{task.name}")
-        TaskStore.update_task_status(task_id, :completed)
+        IO.puts("Executing task: #{task.name}")
       end
       # Re-render the UI
       parent = self()
@@ -99,17 +107,25 @@ defmodule TaskRunner do
     tasks =
       TaskStore.get()
       |> Map.values()
-      |> Enum.sort_by(fn task -> task.due_date end)
+      |> Enum.sort_by(fn task -> task.name end)
 
     table =
       Kino.DataTable.new(tasks,
-        keys: [:name, :due_date, :status],
-        labels: %{name: "Task Name", due_date: "Due Date", status: "Status"}
+        keys: [:name, :cron_string, :status],
+        labels: %{name: "Task Name", cron_string: "Cron String", status: "Status"}
       )
 
     Kino.Frame.render(frame, table)
   end
 end
+```
+
+```elixir
+{:ok, e,} = Crontab.CronExpression.Parser.parse("*/10 * * * * *")
+```
+
+```elixir
+Crontab.DateChecker.matches_date?(e, DateTime.to_naive(DateTime.utc_now())) 
 ```
 
 ## Application UI
@@ -134,7 +150,7 @@ form =
   Kino.Control.form(
     [
       name: Kino.Input.text("Task Name"),
-      due_date: Kino.Input.utc_datetime("Execution Date and Time")
+      cron_string: Kino.Input.text("Cron String")
     ],
     submit: "Add Task"
   )
@@ -145,11 +161,10 @@ form =
 Finally, we listen for submissions on the form. When a user adds a new task, we'll add it to our `TaskStore` and update the displayed list.
 
 ```elixir
- Kino.listen(form, fn %{data: %{name: name, due_date: due_date}} ->
+ Kino.listen(form, fn %{data: %{name: name, cron_string: cron_string}} ->
   IO.puts("listen")
-  if name != "" and not is_nil(due_date) do
-    IO.puts("new task")
-    TaskStore.add_task(name, due_date)
+  if name != "" and cron_string != "" do
+    TaskStore.add_task(name, cron_string)
     send(Process.whereis(TaskRunner), :render_ui)
   end
 end)
